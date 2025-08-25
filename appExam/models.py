@@ -254,6 +254,7 @@ class StudentExamEnrollment(models.Model):
     individual_paused_at = models.DateTimeField(null=True, blank=True)
     individual_paused_duration = models.DurationField(default=timedelta())
 
+
     # Connection status
     present = models.BooleanField(default=False)
 
