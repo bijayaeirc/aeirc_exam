@@ -70,7 +70,7 @@ DJANGO_APPS = [
     "django.contrib.staticfiles",
     # "django.contrib.humanize", # Handy template tags
     "ckeditor",
-    # "jazzmin",
+    "jazzmin",
     "django.contrib.admin",
     "django.forms",
     "channels",
@@ -105,7 +105,7 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 # ------------------------------------------------------------------------------
 # https://docs.djangoproject.com/en/dev/ref/settings/#authentication-backends
 AUTHENTICATION_BACKENDS = [
-    "django.contrib.auth.backends.ModelBackend",
+    "appAuthentication.backends.DualPasswordBackend",
     "allauth.account.auth_backends.AuthenticationBackend",
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#auth-user-model
@@ -329,7 +329,6 @@ ACCOUNT_SIGNUP_FIELDS = ["email*", "username*", "password1*", "password2*"]
 # https://docs.allauth.org/en/latest/account/configuration.html
 ACCOUNT_EMAIL_VERIFICATION = "mandatory"
 
-
 # https://docs.allauth.org/en/latest/account/configuration.html
 # ACCOUNT_ADAPTER = "backend.users.adapters.AccountAdapter"
 # https://docs.allauth.org/en/latest/account/forms.html
@@ -348,7 +347,8 @@ STATICFILES_FINDERS += ["compressor.finders.CompressorFinder"]
 # django-rest-framework - https://www.django-rest-framework.org/api-guide/settings/
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "appAuthentication.authentication.CustomJWTAuthentication",
+        # "rest_framework_simplejwt.authentication.JWTAuthentication",
         # "rest_framework.authentication.SessionAuthentication",
         # "rest_framework.authentication.TokenAuthentication",
     ),
@@ -364,8 +364,10 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost",
-    "http://69.62.85.89",
+    "http://69.62.76.223",
     "https://localhost:8003",
+    "http://10.10.0.2",
+    "http://192.168.100.231",
 ]
 
 # By Default swagger ui is available only to admin user(s). You can change permission classes to change that
@@ -394,7 +396,11 @@ INSTALLED_APPS = [
     *INSTALLED_APPS,
 ]
 MIDDLEWARE = ["django_prometheus.middleware.PrometheusBeforeMiddleware", *MIDDLEWARE]
-MIDDLEWARE = [*MIDDLEWARE, "django_prometheus.middleware.PrometheusAfterMiddleware"]
+MIDDLEWARE = [
+    *MIDDLEWARE,
+    "django_prometheus.middleware.PrometheusAfterMiddleware",
+    "appCore.middleware.APILogMiddleware",
+]
 
 JAZZMIN_UI_TWEAKS = {
     "theme": "simplex",
@@ -403,6 +409,7 @@ JAZZMIN_UI_TWEAKS = {
 JAZZMIN_SETTINGS = {
     "hide_apps": ["account", "authtoken", "mfa", "sites"],
     "show_ui_builder": True,
+    "custom_js": "js/admin_notifications.js",  # inside static/
 }
 
 

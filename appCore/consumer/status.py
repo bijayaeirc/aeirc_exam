@@ -6,7 +6,9 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.db import transaction
 from django.utils import timezone
 
+from appAuthentication.utils.closest_enrollment import get_closest_enrollment
 from appCore.tasks import complete_expired_sessions
+from appCore.tasks import notify_disconnected_candidates
 from appCore.tasks import submit_student_exam
 from appCore.utils.redis_client import get_redis_client
 from appExam.models import StudentExamEnrollment
@@ -30,14 +32,15 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
         if not self.enrollment:
             await self.send_error("No active enrollment")
             return await self.close()
+        if self.enrollment.status == "submitted":
+            return self.send_error("Session Already Submitted")
 
-        # Initial sync and timers
+
         await self._sync_and_start_timer()
-        await self.send_status()
-        return None
+        await self.send_status()  # noqa: RET503
 
     async def disconnect(self, code):
-        await self._pause_timer()
+        await self._log_disconnect()
 
     async def receive_json(self, data, **kwargs):
         msg_type = data.get("type")
@@ -50,6 +53,7 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
         await handler(data)
 
     # --- Handlers ---
+
     async def _handle_ping(self, data):
         await self.send_json({"type": "pong"})
 
@@ -57,18 +61,15 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
         await self.send_error(f"Unknown type: {data.get('type')}")
 
     async def _handle_complete_check(self, data):
-        # trigger session completion if needed
         await sync_to_async(complete_expired_sessions.delay)()
         await self.send_status()
 
     # --- Core logic ---
+
     @sync_to_async
     def _fetch_enrollment(self):
         try:
-            return StudentExamEnrollment.objects.select_related("session").get(
-                candidate=self.scope["user"].candidate_profile,
-                status__in=["active", "inactive"],
-            )
+            return get_closest_enrollment(self.scope["user"].candidate_profile)
         except StudentExamEnrollment.DoesNotExist:
             return None
 
@@ -77,10 +78,10 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
     def _sync_and_start_timer(self):
         enroll = self.enrollment
         enroll.refresh_from_db()
-        # Resume student if session ongoing and not present
+
         if enroll.session.status == "ongoing" and not enroll.present:
             enroll.handle_connect()
-            # schedule submission when time expires
+
             remaining = enroll.effective_time_remaining.total_seconds()
             if remaining > 0:
                 submit_student_exam.apply_async(
@@ -92,17 +93,24 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
 
     @sync_to_async
     @transaction.atomic
-    def _pause_timer(self):
+    def _log_disconnect(self):
         enroll = self.enrollment
-        if enroll.present:
+        if (
+            enroll.present
+            and enroll.session.status == "ongoing"
+            and enroll.status != "submitted"
+        ):
             enroll.handle_disconnect()
-            # revoke any scheduled submit task
-            try:
-                from celery import current_app
 
-                current_app.control.revoke(f"submit_exam_{enroll.id}", terminate=True)
-            except Exception as e:
-                logger.error(f"Failed to revoke submit task: {e}")
+            client = get_redis_client()
+            key = "disconnected_candidates"
+            client.sadd(key, enroll.candidate.symbol_number)
+            client.expire(key, 10)  # Set expiry for batching
+
+            # Schedule task to create notification in 10 seconds
+            notify_disconnected_candidates.apply_async(countdown=10)
+        elif enroll.present:
+            enroll.handle_disconnect()
         return True
 
     async def send_status(self, data=None):
@@ -144,8 +152,8 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
             client.delete(key)
             try:
                 return json.loads(raw)
-            except Exception:
-                logger.error("Invalid JSON event for %s", key)
+            except Exception:  # noqa: BLE001
+                logger.error("Invalid JSON event for %s", key)  # noqa: TRY400
         return None
 
     async def send_error(self, msg):

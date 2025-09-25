@@ -89,7 +89,7 @@ class ExamSession(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.exam} - {self.base_start.strftime('%Y-%m-%d %H:%M')}"
+        return f"{self.exam} - {self.base_start}"
 
     @property
     def effective_start(self):
@@ -155,9 +155,9 @@ class ExamSession(models.Model):
             # Handle disconnected students
             disconnected = self.enrollments.filter(present=False, status="active")
             for enrollment in disconnected:
-                from .tasks import submit_when_time_expires
+                from appCore.tasks import submit_student_exam
 
-                submit_when_time_expires.apply_async(
+                submit_student_exam.apply_async(
                     (enrollment.id,),
                     countdown=enrollment.effective_time_remaining.total_seconds(),
                 )
@@ -173,9 +173,8 @@ class HallAndStudentAssignment(models.Model):
         related_name="hall_assignments",
     )
     hall = models.ForeignKey(Hall, on_delete=models.CASCADE)
-    roll_number_range = models.CharField(
-        max_length=100,
-        help_text="Format: MG12XX10 - MG12XX20",
+    roll_number_range = models.TextField(
+        help_text="Enter one or more roll number ranges, e.g., MG12XX10 - MG12XX20",
     )
 
     def __str__(self):
@@ -226,6 +225,7 @@ class StudentExamEnrollment(models.Model):
     STATUS_CHOICES = [
         ("inactive", "Inactive"),
         ("active", "Active"),
+        ("paused", "Paused"),
         ("submitted", "Submitted"),
     ]
 
@@ -248,7 +248,12 @@ class StudentExamEnrollment(models.Model):
     individual_duration = models.DurationField(default=timedelta(minutes=60))
     connection_start = models.DateTimeField(null=True, blank=True)
     disconnected_at = models.DateTimeField(null=True, blank=True)
+    paused_at = models.DateTimeField(null=True, blank=True)
     paused_duration = models.DurationField(default=timedelta())
+
+    individual_paused_at = models.DateTimeField(null=True, blank=True)
+    individual_paused_duration = models.DurationField(default=timedelta())
+
 
     # Connection status
     present = models.BooleanField(default=False)
@@ -261,68 +266,154 @@ class StudentExamEnrollment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["status", "session"]),
+            models.Index(fields=["session_started_at", "status"]),
+        ]
+
     def __str__(self):
         return f"{self.candidate.symbol_number} - {self.session}"
 
     @property
     def effective_time_remaining(self):
-        if not self.session_started_at or self.status != "active":
+        if not self.session_started_at or self.status not in ["active", "paused"]:
             return timedelta(0)
 
         base_elapsed = timezone.now() - self.session_started_at
 
-        # Add live paused time if disconnected now
-        if self.disconnected_at and not self.present:
-            live_paused = timezone.now() - self.disconnected_at
-        else:
-            live_paused = timedelta(0)
+        ongoing_pause = timedelta()
+        if self.status == "paused":
+            if self.paused_at:
+                ongoing_pause += timezone.now() - self.paused_at
+            if self.individual_paused_at:
+                ongoing_pause += timezone.now() - self.individual_paused_at
 
-        adjusted_elapsed = base_elapsed - self.paused_duration - live_paused
+        total_pause = (
+            self.paused_duration + self.individual_paused_duration + ongoing_pause
+        )
+        adjusted_elapsed = base_elapsed - total_pause
 
-        remaining = self.individual_duration - adjusted_elapsed
-        return max(remaining, timedelta(0))
+        return max(self.individual_duration - adjusted_elapsed, timedelta(0))
 
     @property
     def should_submit(self):
         """Check if time has expired"""
+        if self.status == "submitted":
+            return False
         return self.effective_time_remaining <= timedelta(0)
 
+    def pause(self):
+        if self.status == "active":
+            self.status = "paused"
+            self.paused_at = timezone.now()
+            self.save()
+            return True
+        return False
+
+    def resume(self):
+        now = timezone.now()
+
+        # Resume individual pause
+        if self.individual_paused_at:
+            self.individual_paused_duration += now - self.individual_paused_at
+            self.individual_paused_at = None
+
+        # Resume session-level pause
+        if self.status == "paused" and self.paused_at:
+            self.paused_duration += now - self.paused_at
+            self.paused_at = None
+
+        if self.status != "submitted":
+            self.status = "active"
+            self.save()
+        return True
+
     def handle_connect(self):
-        """Process student connection"""
-        if self.session.status != "ongoing":
+        """Treat connection as resume"""
+        if self.session.status != "ongoing" or self.status == "submitted":
             return False
 
+        now = timezone.now()
+
+        if self.individual_paused_at:
+            self.individual_paused_duration += now - self.individual_paused_at
+            self.individual_paused_at = None
+
         self.present = True
-
-        if not self.connection_start:
-            # First connection
-            self.connection_start = timezone.now()
-            self.status = "active"
-        elif self.disconnected_at:
-            # Resume timing from pause
-            pause_duration = timezone.now() - self.disconnected_at
-            self.paused_duration += pause_duration
-            self.connection_start += pause_duration
-
+        self.connection_start = now
+        self.status = "active"
         self.disconnected_at = None
         self.save()
         return True
 
     def handle_disconnect(self):
-        """Process student disconnection"""
+        """Log disconnection time and start individual pause"""
         self.present = False
         self.disconnected_at = timezone.now()
+
+        if not self.individual_paused_at:
+            self.individual_paused_at = timezone.now()
+
         self.save()
         return True
 
     def submit_exam(self):
         """Finalize exam submission"""
-        if self.status == "active":
+        if self.status != "submitted":
             self.status = "submitted"
             self.present = False
             self.save()
             return True
         return False
+
+    def grant_extra_time(self):
+        total_paused = self.individual_paused_duration
+
+        # If still disconnected, add current disconnection pause duration
+        if self.individual_paused_at:
+            total_paused += timezone.now() - self.individual_paused_at
+            self.individual_paused_at = timezone.now()
+
+        if total_paused > timedelta():
+            self.individual_duration += total_paused
+            self.individual_paused_duration = timedelta()
+            self.save()
+            return True
+
+        return False
+
+
+# ========================= Seat Assignment =============================
+class SeatAssignment(models.Model):
+    enrollment = models.OneToOneField(
+        StudentExamEnrollment,
+        on_delete=models.CASCADE,
+        related_name="seat_assignment",
+    )
+    session = models.ForeignKey(ExamSession, on_delete=models.CASCADE)
+    hall = models.ForeignKey(Hall, on_delete=models.CASCADE)
+    seat_number = models.PositiveIntegerField()
+    session_base_start = models.DateTimeField(null=True)  # for optional DB constraint
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["hall", "seat_number"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hall", "seat_number", "session_base_start"],
+                name="unique_seat_per_time",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.session_base_start:
+            self.session_base_start = self.session.base_start
+        super().save(*args, **kwargs)
+
+    def __str__(self):  # noqa: DJ012
+        return f"{self.enrollment.candidate.symbol_number} - {self.hall.name}-{self.seat_number}"  # noqa: E501
 
 
 # ======================== Student Answer Model ========================

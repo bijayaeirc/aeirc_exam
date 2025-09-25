@@ -1,7 +1,14 @@
 from django.contrib import admin
+from django.contrib import messages
+from django.contrib.admin import site
+from django.shortcuts import redirect
 from django.urls import path
 from django.utils.html import format_html
 
+from appCore.utils.full_exporter import SessionWiseCandidateExportAdmin
+
+from .models import AdminNotification
+from .models import APILog
 from .models import CeleryTask
 from .views import task_last_updated
 
@@ -76,3 +83,72 @@ class CeleryTaskAdmin(admin.ModelAdmin):
         return custom_urls + urls
 
     # Pass timestamp to template
+
+
+@admin.register(AdminNotification)
+class AdminNotificationAdmin(admin.ModelAdmin):
+    list_display = ("text", "level", "created_at", "is_read")
+    list_filter = ("level", "is_read", "created_at")
+    search_fields = ("text",)
+    ordering = ("-created_at",)
+    actions = ["mark_selected_as_read"]
+
+    # Admin action to mark selected as read
+    @admin.action(description="Mark selected notifications as read")
+    def mark_selected_as_read(self, request, queryset):
+        updated = queryset.update(is_read=True)
+        self.message_user(
+            request,
+            f"{updated} notification(s) marked as read.",
+            messages.SUCCESS,
+        )
+
+    # Add custom admin button to mark all as read
+    def changelist_view(self, request, extra_context=None):
+        if extra_context is None:
+            extra_context = {}
+
+        extra_context["mark_all_as_read_url"] = "mark-all-read/"
+        return super().changelist_view(request, extra_context=extra_context)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "mark-all-read/",
+                self.admin_site.admin_view(self.mark_all_as_read),
+                name="mark_all_notifications_as_read",
+            ),
+        ]
+        return custom_urls + urls
+
+    def mark_all_as_read(self, request):
+        count = AdminNotification.objects.filter(is_read=False).update(is_read=True)
+        self.message_user(
+            request,
+            f"{count} unread notification(s) marked as read.",
+            messages.SUCCESS,
+        )
+        return redirect("..")
+
+
+@admin.register(APILog)
+class APILogAdmin(admin.ModelAdmin):
+    list_display = ("timestamp", "user", "path", "method", "status_code")
+    search_fields = ("user", "path", "request_data", "response_data")
+    list_filter = ("method", "status_code", "timestamp")
+
+
+candidate_export_admin = SessionWiseCandidateExportAdmin()
+
+# Add to admin site URLs
+
+# Monkey patch to add custom URLs
+original_get_urls = site.get_urls
+
+def get_urls_with_export():
+    urls = original_get_urls()
+    custom_urls = candidate_export_admin.get_urls()
+    return custom_urls + urls
+
+site.get_urls = get_urls_with_export

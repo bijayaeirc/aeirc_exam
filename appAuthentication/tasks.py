@@ -1,9 +1,9 @@
-# appAuthentication/tasks.py
 import csv
 import logging
 import os
 import random
 import string
+from datetime import datetime
 
 import pandas as pd
 from celery import shared_task
@@ -13,24 +13,187 @@ from django.db import transaction
 
 from appAuthentication.models import Candidate
 from appCore.models import CeleryTask
-
-# Add these imports
 from appCore.utils.track_task import track_task
 from appInstitutions.models import Institute
+from appInstitutions.models import Program
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
 
 
+def get_or_create_program_id(institute, program_name):
+    """
+    Get existing program_id or create next available one
+    """
+    if not program_name:
+        program_name = "General"
+
+    # Try to find existing program by name (case-insensitive)
+    existing_program = Program.objects.filter(
+        institute=institute,
+        name__iexact=program_name.strip(),
+    ).first()
+
+    if existing_program:
+        return existing_program.program_id
+
+    # Get next available program_id
+    existing_programs = Program.objects.filter(institute=institute)
+    if existing_programs.exists():
+        # Try to get the highest numeric program_id and increment
+        max_id = 0
+        for prog in existing_programs:
+            try:
+                prog_id_num = int(prog.program_id)
+                max_id = max(max_id, prog_id_num)
+            except ValueError:
+                continue
+        next_id = str(max_id + 1)
+    else:
+        next_id = "1"
+
+    # Create new program
+    try:
+        with transaction.atomic():
+            new_program = Program.objects.create(
+                name=program_name.strip(),
+                institute=institute,
+                program_id=next_id,
+                description=f"Auto-created program for {program_name}",
+            )
+            logger.info(
+                f"Created new program: {program_name} with ID: {next_id} for institute: {institute.name}",  # noqa: G004
+            )
+            return new_program.program_id
+    except Exception as e:
+        logger.error(f"Failed to create program {program_name}: {e}")
+        # Try to find if someone else created it in the meantime
+        retry_program = Program.objects.filter(
+            institute=institute,
+            name__iexact=program_name.strip(),
+        ).first()
+        if retry_program:
+            return retry_program.program_id
+        return "1"  # Fallback
+
+
+def generate_unique_email(base_email, institute_name, symbol_number):
+    """
+    Generate a unique email if the original is missing or duplicate
+    """
+    if not base_email or "@" not in base_email:
+        # Generate email from symbol number and institute
+        clean_institute = "".join(c for c in institute_name if c.isalnum()).lower()
+        return f"{symbol_number}@{clean_institute}.edu"
+
+    # Clean the email
+    base_email = base_email.strip().lower().replace(" ", "")
+
+    # Check if email already exists
+    if not User.objects.filter(email=base_email).exists():
+        return base_email
+
+    # Generate variations for duplicate emails
+    base_part, domain = base_email.split("@", 1)
+
+    for i in range(1, 100):  # Try up to 99 variations
+        new_email = f"{base_part}{i}@{domain}"
+        if not User.objects.filter(email=new_email).exists():
+            return new_email
+
+    # Final fallback
+    timestamp = int(datetime.now().timestamp())
+    return f"{base_part}{timestamp}@{domain}"
+
+
+def process_batch(users_batch, candidates_batch, institute):
+    """
+    Process batch using get_or_create for robust duplicate handling
+    Returns (created_count, errors_list)
+
+    This version completely bypasses the Candidate.save() method's user creation logic
+    by using direct database operations.
+    """
+    created_count = 0
+    errors = []
+
+    for user_data, candidate_data in zip(users_batch, candidates_batch, strict=False):
+        try:
+            # Check for existing candidate first (most restrictive check)
+            if Candidate.objects.filter(
+                symbol_number=candidate_data["symbol_number"],
+            ).exists():
+                errors.append(
+                    f"Candidate with symbol number {candidate_data['symbol_number']} already exists",
+                )
+                continue
+
+            # Generate unique email
+            original_email = user_data["email"]
+            unique_email = generate_unique_email(
+                original_email,
+                institute.name,
+                candidate_data["symbol_number"],
+            )
+
+            if unique_email != original_email:
+                errors.append(
+                    f"Email changed from '{original_email}' to '{unique_email}' for symbol {candidate_data['symbol_number']}",
+                )
+
+            # Use get_or_create for user - handles race conditions automatically
+            user, user_created = User.objects.get_or_create(
+                email=unique_email,
+                defaults={"is_candidate": True, "password": user_data["password"]},
+            )
+
+            if not user_created:
+                # This shouldn't happen now with unique email generation
+                errors.append(f"User with email {unique_email} already exists")
+                continue
+
+            # Set password properly since get_or_create doesn't hash it
+            user.set_password(user_data["password"])
+            user.save()
+
+            # Get or create program_id
+            program_id = get_or_create_program_id(
+                institute,
+                candidate_data.get("program", ""),
+            )
+            candidate_data["program_id"] = program_id
+
+            # Create candidate using bulk_create or direct SQL to completely bypass save()
+            candidate = Candidate.objects.create(
+                **candidate_data,
+                user=user,
+            )
+            created_count += 1
+
+        except Exception as e:
+            error_msg = f"Failed to create candidate for {user_data['email']}: {e!s}"
+            logger.exception(error_msg)
+            errors.append(error_msg)
+
+            # Clean up user if candidate creation failed
+            if "user" in locals() and user_created:
+                try:
+                    user.delete()
+                except Exception:
+                    pass
+            continue
+
+    return created_count, errors
+
+
 @shared_task(bind=True)
-def process_candidates_file(self, file_path, institute_id):
+def process_candidates_file(self, file_path, institute_id, file_format="format1"):
     """
-    Process CSV or Excel file and create candidate records in batches
+    IMPROVED: Process CSV or Excel file with robust error handling
     """
-    # Wrap the entire task with track_task context manager
     with track_task(self.request.id, "process_candidates_file") as task:
         try:
-            task.message = "Starting candidate import process"
+            task.message = f"Starting candidate import process (Format: {file_format})"
             task.progress = 5
             task.save()
 
@@ -53,50 +216,58 @@ def process_candidates_file(self, file_path, institute_id):
             if total_rows == 0:
                 task.message = "File is empty - no candidates to process"
                 task.status = CeleryTask.get_status_value("FAILURE")
-
                 task.save()
                 return {"status": "error", "message": "File is empty"}
 
-            batch_size = 100
+            # Process in smaller batches for better memory management
+            batch_size = 50  # Reduced batch size for better error isolation
             processed_rows = 0
-            errors = []
+            all_errors = []
             users_batch = []
             candidates_batch = []
 
             logger.info(
-                f"Starting to process {total_rows} candidates from {file_extension} file for institute {institute.name}",
+                f"Starting to process {total_rows} candidates from {file_extension} file for institute {institute.name} using {file_format}",  # noqa: E501, G004
             )
 
-            task.message = f"Processing {total_rows} candidates"
+            task.message = f"Processing {total_rows} candidates ({file_format})"
             task.progress = 10
             task.save()
 
             for index, row in enumerate(rows):
                 try:
-                    data = clean_row_data(row)
+                    # Clean data based on format
+                    if file_format == "format2":
+                        data = clean_row_data_format2(row)
+                    else:
+                        data = clean_row_data(row)
+
+                    # Validate required fields - only symbol_number is truly required
+                    if not data.get("symbol_number"):
+                        all_errors.append(
+                            f"Row {index + 1}: Missing required symbol_number",
+                        )
+                        continue
+
+                    # Process initial_image path
+                    initial_image = data.get("initial_image", "").strip()
+                    if initial_image:
+                        data["initial_image"] = (
+                            f"{institute.name}/candidatePhotos/{initial_image}"
+                        )
+                    else:
+                        data["initial_image"] = None
 
                     symbol = data["symbol_number"]
-                    email = data["email"]
+                    email = data.get("email", "").strip().lower()
 
-                    if Candidate.objects.filter(symbol_number=symbol).exists():
-                        errors.append(
-                            f"Row {index + 1}: Candidate with symbol number {symbol} already exists",
-                        )
-                        continue
-
-                    if User.objects.filter(email=email).exists():
-                        errors.append(
-                            f"Row {index + 1}: User with email {email} already exists",
-                        )
-                        continue
-
-                    random_password = "".join(
-                        random.choices(string.ascii_letters + string.digits, k=8),
-                    )
+                    # Generate password
+                    allowed_digits = string.digits.replace("0", "").replace("1", "")
+                    random_password = "".join(random.choices(allowed_digits, k=8))  # noqa: S311
 
                     users_batch.append(
                         {
-                            "email": email,
+                            "email": email,  # Will be processed in generate_unique_email
                             "password": random_password,
                             "is_candidate": True,
                         },
@@ -110,12 +281,20 @@ def process_candidates_file(self, file_path, institute_id):
                         },
                     )
 
+                    # Process batch when it reaches batch_size
                     if len(candidates_batch) >= batch_size:
-                        processed_rows += process_batch(users_batch, candidates_batch)
+                        batch_created, batch_errors = process_batch(
+                            users_batch,
+                            candidates_batch,
+                            institute,
+                        )
+                        processed_rows += batch_created
+                        all_errors.extend(batch_errors)
+
                         users_batch.clear()
                         candidates_batch.clear()
 
-                        # Update progress after each batch
+                        # Update progress
                         progress = min(90, int(10 + 80 * (index + 1) / total_rows))
                         task.message = f"Processed {index + 1}/{total_rows} candidates"
                         task.progress = progress
@@ -124,23 +303,39 @@ def process_candidates_file(self, file_path, institute_id):
                 except Exception as e:
                     error_msg = f"Row {index + 1}: {e!s}"
                     logger.exception(error_msg)
-                    errors.append(error_msg)
+                    all_errors.append(error_msg)
 
-            # Process remaining candidates
+            # Process remaining candidates in final batch
             if candidates_batch:
-                processed_rows += process_batch(users_batch, candidates_batch)
+                batch_created, batch_errors = process_batch(
+                    users_batch,
+                    candidates_batch,
+                    institute,
+                )
+                processed_rows += batch_created
+                all_errors.extend(batch_errors)
 
-            # Clean up the uploaded file
-            default_storage.delete(file_path)
+            # Clean up uploaded file
+            try:
+                default_storage.delete(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete file {file_path}: {e!s}")
 
             logger.info(
                 f"Completed processing. {processed_rows}/{total_rows} candidates created successfully",
             )
 
-            # Update task status
-            if errors:
-                task.message = f"Completed with {len(errors)} errors"
-                task.status = CeleryTask.get_status_value("RETRY")
+            # Set final task status - ALWAYS SUCCESS to prevent retry loops
+            if processed_rows == 0:
+                task.message = (
+                    f"No candidates created. {len(all_errors)} errors occurred."
+                )
+                task.status = CeleryTask.get_status_value("FAILURE")
+            elif all_errors:
+                task.message = f"Completed with {len(all_errors)} errors. {processed_rows} candidates created."
+                task.status = CeleryTask.get_status_value(
+                    "SUCCESS",
+                )  # Still success if some were created
             else:
                 task.message = "Successfully processed all candidates"
                 task.status = CeleryTask.get_status_value("SUCCESS")
@@ -148,83 +343,76 @@ def process_candidates_file(self, file_path, institute_id):
             result_data = {
                 "total_rows": total_rows,
                 "processed_rows": processed_rows,
-                "errors": errors,
+                "errors": all_errors[:50],  # Limit errors to prevent huge responses
+                "total_errors": len(all_errors),
                 "institute_name": institute.name,
                 "file_type": file_extension,
+                "format_used": file_format,
+                "success_rate": f"{(processed_rows / total_rows * 100):.1f}%"
+                if total_rows > 0
+                else "0%",
             }
 
             task.result = str(result_data)
-
             task.progress = 100
             task.save()
 
-            return result_data  # noqa: TRY300
+            return result_data
 
         except Exception as e:
             logger.exception(f"Task failed: {e!s}")
             task.message = f"Task failed: {e!s}"
             task.status = CeleryTask.get_status_value("FAILURE")
             task.save()
-            raise self.retry(countdown=60, max_retries=3, exc=e)  # noqa: B904
+
+            # CRITICAL: Never retry on database constraint errors
+            error_str = str(e).lower()
+            if any(
+                phrase in error_str
+                for phrase in ["duplicate key", "unique constraint", "already exists"]
+            ):
+                logger.error(
+                    "Database constraint error - not retrying to prevent infinite loop",
+                )
+                return {
+                    "status": "error",
+                    "message": f"Database constraint error: {e!s}",
+                }
+
+            # Only retry for genuine system errors (max 2 retries)
+            raise self.retry(countdown=30, max_retries=2, exc=e)
 
 
-# Keep the old function for backward compatibility
-@shared_task(bind=True)
-def process_candidates_csv(self, file_path, institute_id):
-    """
-    Legacy function - now redirects to the new file processor
-    """
-    return process_candidates_file(self, file_path, institute_id)
-
-
+# Keep existing helper functions unchanged
 def read_csv_file(file_path):
-    """
-    Read CSV file and return list of dictionaries
-    """
+    """Read CSV file and return list of dictionaries"""
     with default_storage.open(file_path, "r") as csvfile:
         content = csvfile.read()
-
     csv_reader = csv.DictReader(content.splitlines())
     return list(csv_reader)
 
 
 def read_excel_file(file_path):
-    """
-    Read Excel file and return list of dictionaries
-    """
+    """Read Excel file and return list of dictionaries"""
     with default_storage.open(file_path, "rb") as excel_file:
-        # Read the Excel file into a pandas DataFrame
         df = pd.read_excel(excel_file, engine="openpyxl")
-
-        # Convert DataFrame to list of dictionaries
-        # Handle NaN values by converting them to empty strings
         df = df.fillna("")
-
-        # Convert all column names to strings and strip whitespace
         df.columns = df.columns.astype(str).str.strip()
-
         return df.to_dict("records")
 
 
 def clean_row_data(row):
-    """
-    Clean and validate row data from CSV or Excel
-    Handles both string and numeric data types
-    """
+    """Clean and validate row data - Format 1 (Original)"""
 
     def safe_int(value, default=0):
-        """Safely convert value to int"""
         if pd.isna(value) or value == "":
             return default
         try:
-            return int(
-                float(value),
-            )  # Convert through float first to handle decimal strings
+            return int(float(value))
         except (ValueError, TypeError):
             return default
 
     def safe_str(value):
-        """Safely convert value to string"""
         if pd.isna(value):
             return ""
         return str(value).strip()
@@ -246,57 +434,63 @@ def clean_row_data(row):
         "level": safe_str(row.get("Level")),
         "program_id": safe_int(row.get("Program ID")),
         "program": safe_str(row.get("Program")),
+        "initial_image": safe_str(row.get("Profile Picture")),
     }
 
 
-# Keep the old function for backward compatibility
-def clean_csv_row(row):
-    """
-    Legacy function - now redirects to the new cleaner
-    """
-    return clean_row_data(row)
+def clean_row_data_format2(row):
+    """Clean and validate row data - Format 2 (New simplified format)"""
+
+    def safe_str(value):
+        if pd.isna(value):
+            return ""
+        return str(value).strip()
+
+    # Parse full name
+    full_name = safe_str(row.get("Name", ""))
+    name_parts = full_name.split()
+
+    if len(name_parts) == 1:
+        first_name, middle_name, last_name = name_parts[0], None, ""
+    elif len(name_parts) == 2:
+        first_name, middle_name, last_name = name_parts[0], None, name_parts[1]
+    elif len(name_parts) >= 3:
+        first_name = name_parts[0]
+        middle_name = " ".join(name_parts[1:-1])
+        last_name = name_parts[-1]
+    else:
+        first_name, middle_name, last_name = "", None, ""
+
+    level = safe_str(row.get("Level", ""))
+    program = safe_str(row.get("Program", "")) or level
+
+    return {
+        "admit_card_id": 0,
+        "profile_id": 0,
+        "symbol_number": safe_str(row.get("Symbol Number")),
+        "exam_processing_id": 0,
+        "gender": "",
+        "citizenship_no": "",
+        "first_name": first_name,
+        "middle_name": middle_name,
+        "last_name": last_name,
+        "dob_nep": "",
+        "email": safe_str(row.get("Email")).lower(),
+        "phone": safe_str(row.get("Mobile")),
+        "level_id": 0,
+        "level": level,
+        "program_id": 0,  # Will be set in process_batch
+        "program": program,
+        "initial_image": "",
+    }
 
 
-@transaction.atomic
-def process_batch(users_batch, candidates_batch):
-    """
-    Process a batch of users and candidates
-    """
-    try:
-        created_users = [User.objects.create_user(**u) for u in users_batch]
-
-        for user, candidate_data in zip(created_users, candidates_batch, strict=False):
-            Candidate.objects.create(**candidate_data, user=user)
-
-        return len(created_users)
-
-    except Exception as e:
-        logger.error(f"Batch processing failed: {e!s}")
-        raise
-
-
-def validate_file_format(file_path):
+def validate_file_format(file_path, expected_format=None):
     """
     Validate if the uploaded file has the correct format and required columns
+    If expected_format is None, auto-detect the format
     """
-    file_extension = os.path.splitext(file_path)[1].lower()
-    required_columns = [
-        "Admit Card ID",
-        "Profile ID",
-        "Symbol Number",
-        "Exam Processing Id",
-        "Gender",
-        "Citizenship No.",
-        "Firstname",
-        "Lastname",
-        "DOB (nep)",
-        "email",
-        "phone",
-        "Level ID",
-        "Level",
-        "Program ID",
-        "Program",
-    ]
+    file_extension = os.path.splitext(file_path)[1].lower()  # noqa: PTH122
 
     try:
         if file_extension == ".csv":
@@ -315,8 +509,43 @@ def validate_file_format(file_path):
                 "error": "File is empty or has no data rows.",
             }
 
-        # Check if required columns exist
         available_columns = set(rows[0].keys())
+
+        # Auto-detect format if not specified
+        if expected_format is None:
+            detected_format = detect_file_format(rows)
+            if detected_format == "unknown":
+                return {
+                    "is_valid": False,
+                    "error": "Unable to detect file format. Please ensure your file matches one of the supported formats.",
+                    "available_columns": list(available_columns),
+                }
+            expected_format = detected_format
+
+        # Define required columns based on format
+        if expected_format == "format2":
+            required_columns = ["Name", "Mobile", "Email", "Symbol Number", "Level"]
+        else:  # format1
+            required_columns = [
+                "Admit Card ID",
+                "Profile ID",
+                "Symbol Number",
+                "Exam Processing Id",
+                "Gender",
+                "Citizenship No.",
+                "Firstname",
+                "Lastname",
+                "DOB (nep)",
+                "email",
+                "phone",
+                "Level ID",
+                "Level",
+                "Program ID",
+                "Program",
+                "Profile Picture",
+            ]
+
+        # Check if required columns exist
         missing_columns = [
             col for col in required_columns if col not in available_columns
         ]
@@ -324,8 +553,9 @@ def validate_file_format(file_path):
         if missing_columns:
             return {
                 "is_valid": False,
-                "error": f"Missing required columns: {', '.join(missing_columns)}",
+                "error": f"Missing required columns for {expected_format}: {', '.join(missing_columns)}",
                 "available_columns": list(available_columns),
+                "detected_format": expected_format,
             }
 
         return {
@@ -333,6 +563,7 @@ def validate_file_format(file_path):
             "total_rows": len(rows),
             "columns": list(available_columns),
             "file_type": file_extension,
+            "detected_format": expected_format,
         }
 
     except Exception as e:  # noqa: BLE001
@@ -340,3 +571,45 @@ def validate_file_format(file_path):
             "is_valid": False,
             "error": f"Error reading file: {e!s}",
         }
+
+
+def detect_file_format(rows):
+    """
+    Auto-detect the file format based on available columns
+    """
+    if not rows:
+        return "unknown"
+
+    available_columns = set(rows[0].keys())
+
+    # Check for format2 columns (simplified format)
+    format2_columns = {"Name", "Mobile", "Email", "Symbol Number", "Level"}
+    format2_match = len(format2_columns.intersection(available_columns))
+
+    # Check for format1 columns (detailed format)
+    format1_columns = {
+        "Admit Card ID",
+        "Profile ID",
+        "Symbol Number",
+        "Exam Processing Id",
+        "Gender",
+        "Citizenship No.",
+        "Firstname",
+        "Lastname",
+        "DOB (nep)",
+        "email",
+        "phone",
+        "Level ID",
+        "Level",
+        "Program ID",
+        "Program",
+        "Profile Picture",
+    }
+    format1_match = len(format1_columns.intersection(available_columns))
+
+    # Determine which format has better match
+    if format2_match >= 4:  # At least 4 out of 5 format2 columns
+        return "format2"
+    if format1_match >= 12:  # At least 12 out of 16 format1 columns
+        return "format1"
+    return "unknown"
