@@ -75,11 +75,14 @@ class Candidate(models.Model):
         choices=VerificationStatus.choices,
         default=VerificationStatus.PENDING,
     )
-    verification_notes = models.CharField(
+
+    verification_notes = models.CharField(  # noqa: DJ001
         max_length=100,
-        blank="",
+        blank=True,  # Changed from blank="" to blank=True
         default="",
+        null=True,
     )
+
     exam_status = models.CharField(
         max_length=10,
         choices=ExamStatus.choices,
@@ -91,40 +94,52 @@ class Candidate(models.Model):
         on_delete=models.CASCADE,
         related_name="candidate_profile",
     )
-    admit_card_id = models.IntegerField()
-    profile_id = models.IntegerField()
+
+    # Fields that can be null/empty
+    admit_card_id = models.IntegerField(null=True, blank=True)
+    profile_id = models.IntegerField(null=True, blank=True)
+    exam_processing_id = models.IntegerField(null=True, blank=True)
+    gender = models.CharField(max_length=10, null=True, blank=True)  # noqa: DJ001
+    citizenship_no = models.CharField(max_length=100, null=True, blank=True)  # noqa: DJ001
+    last_name = models.CharField(max_length=100, null=True, blank=True)  # noqa: DJ001
+
+    # REQUIRED FIELDS - Only symbol_number is truly required
     symbol_number = models.CharField(max_length=100, unique=True)
-    exam_processing_id = models.IntegerField()
-    gender = models.CharField(max_length=10)
-    citizenship_no = models.CharField(max_length=100)
-    first_name = models.CharField(max_length=100)
-    middle_name = models.CharField(max_length=100, blank=True, null=True)  # noqa: DJ001
-    last_name = models.CharField(max_length=100)
-    dob_nep = models.CharField(max_length=20)
-    email = models.EmailField()
-    phone = models.CharField(max_length=20)
-    level_id = models.IntegerField()
-    level = models.CharField(max_length=100)
-    program_id = models.IntegerField()
-    program = models.CharField(max_length=100)
+
+    # Fields with defaults to avoid empty string issues
+    first_name = models.CharField(max_length=100, default="", blank=True)
+    dob_nep = models.CharField(max_length=20, default="", blank=True)
+    email = models.EmailField(default="", blank=True)
+    phone = models.CharField(max_length=20, default="", blank=True)
+    level_id = models.IntegerField(default=0, blank=True)
+    level = models.CharField(max_length=100, default="", blank=True)
+    program_id = models.IntegerField(default=0, blank=True)
+    program = models.CharField(max_length=100, default="", blank=True)
     generated_password = models.CharField(max_length=128)
+
+    # Nullable field as intended
+    middle_name = models.CharField(max_length=100, blank=True, null=True)  # noqa: DJ001
+
+    # Image fields (already correct)
     initial_image = models.ImageField(
         upload_to=image_upload_to_institute,
         blank=True,
         null=True,
     )
 
-    # this is image to be verified
+    # This is image to be verified
     profile_image = models.ImageField(
         upload_to=image_upload_to_institute,
         blank=True,
         null=True,
     )
+
     fingerprint_left = models.ImageField(
         upload_to=fingerprint_upload_to_institute,
         blank=True,
         null=True,
     )
+
     fingerprint_right = models.ImageField(
         upload_to=fingerprint_upload_to_institute,
         blank=True,
@@ -135,15 +150,76 @@ class Candidate(models.Model):
         Institute,
         on_delete=models.CASCADE,
         related_name="candidates",
-        null=True,
-        blank=True,
     )
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["symbol_number"]),
+            models.Index(fields=["institute", "symbol_number"]),
+            models.Index(fields=["verification_status"]),
+            models.Index(fields=["exam_status"]),
+        ]
+        verbose_name = "Candidate"
+        verbose_name_plural = "Candidates"
+
     def __str__(self):
-        return f"{self.first_name} {self.last_name} ({self.symbol_number})"
+        # Handle cases where names might be empty
+        first = self.first_name or "Unknown"
+        last = self.last_name or ""
+        return f"{first} {last} ({self.symbol_number})".strip()
+
+    def save(self, *args, **kwargs):
+        # Check if this is a new instance or if user doesn't exist
+        create_user = False
+
+        # New instance - definitely need to create user
+        if not hasattr(self, "user_id") or self.user_id is None:
+            create_user = True
+
+        if create_user:
+            email_to_use = (
+                self.email if self.email else f"{self.symbol_number}@example.com"
+            )
+            password_to_use = self.generated_password
+            user = User.objects.create_user(
+                email=email_to_use,
+                password=password_to_use,
+                is_candidate=True,
+            )
+            self.user = user
+
+        # Clean and validate data before saving
+        self.symbol_number = self.symbol_number.strip() if self.symbol_number else ""
+        self.email = self.email.strip().lower() if self.email else ""
+        self.first_name = self.first_name.strip() if self.first_name else ""
+
+        # Check if generated_password has changed (only for existing instances)
+        password_changed = False
+        if self.pk:
+            try:
+                old_instance = Candidate.objects.get(pk=self.pk)
+                if old_instance.generated_password != self.generated_password:
+                    password_changed = True
+            except Candidate.DoesNotExist:
+                password_changed = True
+        else:
+            # For new instances, always update password if generated_password is set
+            password_changed = bool(self.generated_password)
+
+        super().save(*args, **kwargs)
+
+        # Update user password if needed
+        if (
+            password_changed
+            and self.generated_password
+            and hasattr(self, "user")
+            and self.user
+        ):
+            self.user.set_password(self.generated_password)
+            self.user.save()
 
     def delete(self, *args, **kwargs):
-        # delete linked user first
+        # Delete linked user first
         if self.user:
             self.user.delete()
         super().delete(*args, **kwargs)

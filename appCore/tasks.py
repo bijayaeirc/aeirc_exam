@@ -4,6 +4,8 @@ from datetime import timedelta
 from celery import shared_task
 from django.utils import timezone
 
+from appCore.models import AdminNotification
+from appCore.utils.redis_client import get_redis_client
 from appExam.models import ExamSession
 from appExam.models import StudentExamEnrollment
 
@@ -19,7 +21,7 @@ def exam_monitor():
     """Central task that coordinates all exam checks."""
     activate_scheduled_sessions.delay()
     complete_expired_sessions.delay()
-    submit_expired_students.delay()  # NEW: Check individual student time limits
+    submit_expired_students.delay()
     return "Exam monitoring tasks dispatched"
 
 
@@ -68,7 +70,8 @@ def submit_expired_students():
 
     # Get all active/paused enrollments from ongoing sessions
     enrollments = StudentExamEnrollment.objects.filter(
-        status__in=["active", "paused"], session__status__in=["ongoing", "paused"],
+        status__in=["active", "paused"],
+        session__status__in=["ongoing", "paused"],
     ).select_related("session")
 
     for enrollment in enrollments:
@@ -121,7 +124,7 @@ def submit_student_exam(enrollment_id):
                 logger.info(f"Successfully submitted enrollment {enrollment_id}")
                 return f"Submitted enrollment {enrollment_id}"
             return f"Enrollment {enrollment_id} was already submitted"
-        return (
+        return (  # noqa: TRY300
             f"Enrollment {enrollment_id} not in submittable state: {enrollment.status}"
         )
     except StudentExamEnrollment.DoesNotExist:
@@ -217,3 +220,25 @@ def force_submit_student(enrollment_id, reason="Manual override"):
         return f"Enrollment {enrollment_id} already submitted"
     except StudentExamEnrollment.DoesNotExist:
         return f"Enrollment {enrollment_id} not found"
+
+
+@shared_task
+def notify_disconnected_candidates():
+    client = get_redis_client()
+    key = "disconnected_candidates"
+    candidates = client.smembers(key)
+
+    if candidates:
+        # Convert from bytes to str if Redis returns bytes
+        candidates = [
+            c.decode("utf-8") if isinstance(c, bytes) else c for c in candidates
+        ]
+
+        # Compose single notification
+        msg = f"Candidates disconnected in last 10s: {', '.join(candidates)}"
+
+        AdminNotification.objects.create(
+            text=msg,
+            level="warning",
+        )
+        client.delete(key)

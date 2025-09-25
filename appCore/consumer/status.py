@@ -6,12 +6,12 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.db import transaction
 from django.utils import timezone
 
-from appCore.models import AdminNotification  # Ensure this is imported
+from appAuthentication.utils.closest_enrollment import get_closest_enrollment
 from appCore.tasks import complete_expired_sessions
+from appCore.tasks import notify_disconnected_candidates
 from appCore.tasks import submit_student_exam
 from appCore.utils.redis_client import get_redis_client
 from appExam.models import StudentExamEnrollment
-from appAuthentication.utils.closest_enrollment import get_closest_enrollment
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,9 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
         if not self.enrollment:
             await self.send_error("No active enrollment")
             return await self.close()
+        if self.enrollment.status == "submitted":
+            return self.send_error("Session Already Submitted")
+
 
         await self._sync_and_start_timer()
         await self.send_status()  # noqa: RET503
@@ -99,10 +102,13 @@ class ExamStatusConsumer(AsyncJsonWebsocketConsumer):
         ):
             enroll.handle_disconnect()
 
-            AdminNotification.objects.create(
-                text=f"{enroll.candidate.full_name} disconnected during the exam.",
-                level="warning",
-            )
+            client = get_redis_client()
+            key = "disconnected_candidates"
+            client.sadd(key, enroll.candidate.symbol_number)
+            client.expire(key, 10)  # Set expiry for batching
+
+            # Schedule task to create notification in 10 seconds
+            notify_disconnected_candidates.apply_async(countdown=10)
         elif enroll.present:
             enroll.handle_disconnect()
         return True

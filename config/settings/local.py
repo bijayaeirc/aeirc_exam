@@ -24,9 +24,8 @@ ALLOWED_HOSTS = [
     "django",
     "192.168.254.143",
     "10.10.0.101",
-    "69.62.85.89",
+    "69.62.76.223",
     "10.10.0.2",
-    "ioe.clamphook.com"
 ]
 
 
@@ -144,9 +143,6 @@ AWS_S3_OBJECT_PARAMETERS = {
 
 # File handling settings
 AWS_LOCATION = ""  # Store files in bucket root
-
-
-
 
 
 # ===================================================================

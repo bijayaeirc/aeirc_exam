@@ -1,8 +1,11 @@
 from django.contrib import admin
 from django.contrib import messages
+from django.contrib.admin import site
 from django.shortcuts import redirect
 from django.urls import path
 from django.utils.html import format_html
+
+from appCore.utils.full_exporter import SessionWiseCandidateExportAdmin
 
 from .models import AdminNotification
 from .models import APILog
@@ -134,3 +137,18 @@ class APILogAdmin(admin.ModelAdmin):
     list_display = ("timestamp", "user", "path", "method", "status_code")
     search_fields = ("user", "path", "request_data", "response_data")
     list_filter = ("method", "status_code", "timestamp")
+
+
+candidate_export_admin = SessionWiseCandidateExportAdmin()
+
+# Add to admin site URLs
+
+# Monkey patch to add custom URLs
+original_get_urls = site.get_urls
+
+def get_urls_with_export():
+    urls = original_get_urls()
+    custom_urls = candidate_export_admin.get_urls()
+    return custom_urls + urls
+
+site.get_urls = get_urls_with_export

@@ -1,21 +1,25 @@
+from datetime import datetime
 from datetime import timedelta
 
 from django.contrib import admin
-from django.contrib import messages
+from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.urls import path
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.html import escape
-from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 
 from appCore.tasks import pause_exam_session
 from appCore.tasks import resume_exam_session
+from appExam.admin_mixins import ExamSessionActionMixin
+from appExam.admin_mixins import ExamSessionBulkActionMixin
+from appExam.admin_mixins import ExamSessionDisplayMixin
 
-from .admin_view import enroll_students_view
 from .admin_view import download_results_csv_view
+from .admin_view import enroll_students_view
+from .forms import DocumentUploadForm
 from .forms import ExamSessionForm
 from .models import Answer
 from .models import Exam
@@ -28,9 +32,8 @@ from .models import StudentExamEnrollment
 from .question_admin_view import import_questions_document_view
 from .question_admin_view import import_questions_view
 from .question_admin_view import parse_questions_view
-
-from .utils.export_student_details_pdf import download_exam_pdf_view  # noqa: ERA001
 from .utils.export_student_details_pdf import download_exam_excel_view
+from .utils.export_student_details_pdf import download_exam_pdf_view
 
 admin.site.register(StudentAnswer)
 
@@ -68,6 +71,15 @@ class EnrollmentInline(admin.TabularInline):
     can_delete = False
 
 
+class QuestionInline(admin.TabularInline):
+    model = Question
+    fk_name = "session"
+    fields = ("text",)
+    readonly_fields = ("text",)
+    extra = 0
+    can_delete = False
+
+
 # Custom filter: Sessions ending within next X minutes
 class TimeLeftFilter(admin.SimpleListFilter):
     title = "Time Left"
@@ -88,28 +100,71 @@ class TimeLeftFilter(admin.SimpleListFilter):
         return queryset
 
 
+class BaseStartDateTimeFilter(admin.SimpleListFilter):
+    title = "Base Start"
+    parameter_name = "filter_base_start"
+
+    def lookups(self, request, model_admin):
+        return []
+
+    def queryset(self, request, queryset):
+        date = request.GET.get("base_start__date")
+        time_str = request.GET.get("base_start__time")
+
+        if date and time_str:
+            try:
+                # Parse as local timezone
+                dt_str = f"{date} {time_str}"
+                local_dt = timezone.make_aware(
+                    datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S"),  # noqa: DTZ007
+                )
+                # Convert to UTC for DB querying
+                dt_utc = local_dt.astimezone(timezone.utc)
+                return queryset.filter(base_start=dt_utc)
+            except Exception:  # noqa: BLE001
+                return queryset
+
+        elif date:
+            try:
+                local_date = datetime.strptime(date, "%Y-%m-%d")  # noqa: DTZ007
+                local_dt = timezone.make_aware(local_date)
+                utc_date = local_dt.astimezone(timezone.utc).date()
+                return queryset.filter(base_start__date=utc_date)
+            except Exception:  # noqa: BLE001
+                return queryset
+
+        return queryset
+
+
 @admin.register(ExamSession)
-class ExamSessionAdmin(admin.ModelAdmin):
+class ExamSessionAdmin(
+    ExamSessionActionMixin,
+    ExamSessionDisplayMixin,
+    ExamSessionBulkActionMixin,
+    admin.ModelAdmin,
+):
     form = ExamSessionForm
+    change_list_template = "admin/exam_session_changelist.html"
     search_fields = ("id", "exam_program")
     ordering = ("-base_start",)
     list_display = (
         "id",
         "exam",
-        "base_start",
+        "base_start_display",
         "base_duration",
+        "question_count",
+        "enrollment_count",
         "status_colored",
         "expected_end",
         "pause_resume_button",
         "actions_column",
     )
-    list_filter = ("status", "exam__program", TimeLeftFilter)
+    list_filter = ("status", "exam__program", TimeLeftFilter, BaseStartDateTimeFilter)
     date_hierarchy = "base_start"
     list_display_links = ("id", "exam")
-    list_per_page = 10
-    actions = ["bulk_pause", "bulk_resume", "bulk_end"]
-    inlines = [EnrollmentInline]
-
+    list_per_page = 20
+    actions = ["bulk_pause", "bulk_resume", "bulk_end", "enroll_students_action"]
+    inlines = [EnrollmentInline, QuestionInline]
     readonly_fields = (
         "effective_start",
         "expected_end",
@@ -138,33 +193,31 @@ class ExamSessionAdmin(admin.ModelAdmin):
         "created_at",
     )
 
-    def import_questions_link(self, obj):
-        if obj.pk:
-            url = reverse("admin:appExam_question_import_document", args=[obj.pk])
-            return format_html(
-                '<a class="btn btn-sm btn-outline-success" href="{}">📥 Import Questions</a>',  # noqa: E501
-                url,
-            )
-        return "-"
-
-    def status_colored(self, obj):
-        color_map = {
-            "scheduled": "gray",
-            "ongoing": "green",
-            "paused": "orange",
-            "completed": "blue",
-            "cancelled": "red",
-        }
-        color = color_map.get(obj.status, "black")
-        return format_html(
-            '<span style="color: {}; font-weight:bold">{}</span>',
-            color,
-            obj.get_status_display(),
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.annotate(
+            question_count=Count("question", distinct=True),
+            enrollment_count=Count("enrollments", distinct=True),
         )
 
-    status_colored.short_description = "Status"
+    def question_count(self, obj):
+        return obj.question_count
+
+    question_count.short_description = "Questions"
+
+    def enrollment_count(self, obj):
+        return obj.enrollment_count
+
+    enrollment_count.short_description = "Enrollments"
+
+    def changelist_view(self, request, extra_context=None):
+        extra_context = extra_context or {}
+        extra_context["upload_form"] = DocumentUploadForm()
+        extra_context["base_start_filters"] = self.get_base_start_filters(request)
+        return super().changelist_view(request, extra_context=extra_context)
 
     def get_urls(self):
+        """Add custom URLs for session management"""
         urls = super().get_urls()
         custom_urls = [
             path(
@@ -172,7 +225,6 @@ class ExamSessionAdmin(admin.ModelAdmin):
                 self.admin_site.admin_view(download_exam_excel_view),
                 name="exam_session_download_excel",
             ),
-
             path(
                 "<int:session_id>/download-results-csv/",
                 self.admin_site.admin_view(download_results_csv_view),
@@ -202,109 +254,32 @@ class ExamSessionAdmin(admin.ModelAdmin):
         return custom_urls + urls
 
     def actions_column(self, obj):
-        if not obj.pk:
-            return "-"
-
-        enroll_url = reverse("admin:enroll_students", args=[obj.pk])
-        import_url = reverse("admin:appExam_question_import_document", args=[obj.pk])
-        pdf_url = reverse("admin:exam_session_download_pdf", args=[obj.pk])
-        excel_url = reverse("admin:exam_session_download_excel", args=[obj.pk])
-
-        show_results_html = ""
-        if obj.status == "completed":
-            results_url = reverse("admin:exam_session_download_results_csv", args=[obj.pk])
-            show_results_html = f'<a href="{results_url}" class="btn btn-sm btn-outline-secondary">📊 Show Results</a>'
-
-        return format_html(
-            """
-            <a href="{}" class="btn btn-sm btn-outline-primary" style="margin-right: 5px;">📝 Enroll</a>
-            <a href="{}" class="btn btn-sm btn-outline-success" style="margin-right: 5px;">📥 Import</a>
-            <a href="{}" class="btn btn-sm btn-outline-info" style="margin-right: 5px;">📄 Export PDF</a>
-            <a href="{}" class="btn btn-sm btn-outline-info" style="margin-right: 5px;">📄 Export Excel</a>
-            {}
-            """,
-            enroll_url,
-            import_url,
-            pdf_url,
-            excel_url,
-            format_html(show_results_html),
-        )
+        """Display actions dropdown - now using the mixin"""
+        standalone, dropdown = self.get_session_actions(obj)
+        return self.render_dropdown_actions(standalone, dropdown)
 
     actions_column.short_description = "Actions"
 
-    def pause_session(self, request, object_id):
-        session = get_object_or_404(ExamSession, pk=object_id)
-        pause_exam_session.delay(session.id)
-        self.message_user(request, "Exam session pause initiated")
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "../"))
-
-    def resume_session(self, request, object_id):
-        session = get_object_or_404(ExamSession, pk=object_id)
-        resume_exam_session.delay(session.id)
-        self.message_user(request, "Exam session resume initiated")
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "../"))
-
-    def pause_resume_button(self, obj):
-        if obj.status == "ongoing":
-            return format_html(
-                '<a class="button" href="{}">⏸ Pause</a>',
-                reverse("admin:exam_session_pause", args=[obj.id]),
-            )
-        if obj.status == "paused":
-            return format_html(
-                '<a class="button" href="{}">▶ Resume</a>',
-                reverse("admin:exam_session_resume", args=[obj.id]),
-            )
-        return format_html('<span class="button disabled">Not Active</span>')
-
-    pause_resume_button.short_description = "Session Control"
-
     def session_controls(self, obj):
+        """Session controls field for detail view"""
         return self.pause_resume_button(obj)
 
     session_controls.short_description = "Controls"
 
-    # Bulk actions
-    def bulk_pause(self, request, queryset):
-        for sess in queryset.filter(status="ongoing"):
-            pause_exam_session.delay(sess.id)
-        self.message_user(request, "Selected sessions are being paused")
+    # Session control methods
+    def pause_session(self, request, object_id):
+        """Pause a specific session"""
+        session = get_object_or_404(ExamSession, pk=object_id)
+        pause_exam_session.delay(session.id)
+        self.message_user(request, f"Exam session '{session}' pause initiated")
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "../"))
 
-    bulk_pause.short_description = "Pause selected sessions"
-
-    def bulk_resume(self, request, queryset):
-        for sess in queryset.filter(status="paused"):
-            resume_exam_session.delay(sess.id)
-        self.message_user(request, "Selected sessions are being resumed")
-
-    bulk_resume.short_description = "Resume selected sessions"
-
-    def bulk_end(self, request, queryset):
-        # End each session immediately via model method
-        count = 0
-        for sess in queryset.filter(status__in=["ongoing", "paused"]):
-            if sess.end_session():
-                count += 1
-        self.message_user(request, f"Ended {count} selected sessions")
-
-    bulk_end.short_description = "End selected sessions"
-
-    # Custom action for student enrollment
-    def enroll_students_action(self, request, queryset):
-        """Admin action to enroll students for selected exam sessions"""
-        if queryset.count() > 1:
-            self.message_user(
-                request,
-                "Please select only one exam session at a time for enrollment.",
-                level=messages.ERROR,
-            )
-            return None
-
-        session = queryset.first()
-        url = reverse("admin:enroll_students", args=[session.pk])
-        return HttpResponseRedirect(url)
-
-    enroll_students_action.short_description = "📝 Enroll students by symbol range"
+    def resume_session(self, request, object_id):
+        """Resume a specific session"""
+        session = get_object_or_404(ExamSession, pk=object_id)
+        resume_exam_session.delay(session.id)
+        self.message_user(request, f"Exam session '{session}' resume initiated")
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "../"))
 
 
 # Filter for disconnected students
@@ -328,7 +303,13 @@ class DisconnectedFilter(admin.SimpleListFilter):
 
 @admin.register(StudentExamEnrollment)
 class StudentExamEnrollmentAdmin(admin.ModelAdmin):
-    search_fields = ("candidate__symbol_number", "session__id")
+    search_fields = (
+        "candidate__symbol_number",
+        "candidate__first_name",
+        "candidate__middle_name",
+        "candidate__last_name",
+        "session__id",
+    )
     ordering = ("-connection_start",)
     list_display = (
         "candidate",
@@ -337,7 +318,11 @@ class StudentExamEnrollmentAdmin(admin.ModelAdmin):
         "present",
         "effective_time_remaining_display",
     )
-    list_filter = ("session__status", "session__exam__program", DisconnectedFilter)
+    list_filter = (
+        "session__status",
+        "session__exam__program",
+        DisconnectedFilter,
+    )
     list_per_page = 30
     actions = ["force_submit", "grant_extra_time"]
 
